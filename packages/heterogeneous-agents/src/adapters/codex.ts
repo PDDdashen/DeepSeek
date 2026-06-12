@@ -1,0 +1,785 @@
+import type {
+  AgentEventAdapter,
+  HeterogeneousAgentEvent,
+  HeterogeneousTerminalErrorData,
+  StepCompleteData,
+  StreamStartData,
+  ToolCallPayload,
+  ToolResultData,
+  UsageData,
+} from '../types';
+
+const CODEX_IDENTIFIER = 'codex';
+const CODEX_COLLAB_TOOL_CALL_API = 'collab_tool_call';
+const CODEX_COMMAND_API = 'command_execution';
+const CODEX_FILE_CHANGE_API = 'file_change';
+const CODEX_MCP_TOOL_CALL_API = 'mcp_tool_call';
+const CODEX_TODO_LIST_API = 'todo_list';
+
+interface CodexBaseItem {
+  id: string;
+  status?: string;
+  type: string;
+}
+
+interface CodexCommandExecutionItem extends CodexBaseItem {
+  aggregated_output?: string;
+  command?: string;
+  exit_code?: number | null;
+}
+
+interface CodexTodoListEntry {
+  completed?: boolean;
+  text?: string;
+}
+
+interface CodexTodoListItem extends CodexBaseItem {
+  items?: CodexTodoListEntry[];
+}
+
+interface CodexFileChangeEntry {
+  diffText?: string;
+  kind?: string;
+  linesAdded?: number;
+  linesDeleted?: number;
+  path?: string;
+}
+
+interface CodexFileChangeItem extends CodexBaseItem {
+  changes?: CodexFileChangeEntry[];
+  diffText?: string;
+  linesAdded?: number;
+  linesDeleted?: number;
+}
+
+interface CodexMcpToolCallItem extends CodexBaseItem {
+  arguments?: unknown;
+  error?: unknown;
+  result?: unknown;
+  server?: string;
+  tool?: string;
+}
+
+interface CodexCollabAgentState {
+  message?: string | null;
+  status?: string;
+}
+
+interface CodexCollabToolCallItem extends CodexBaseItem {
+  agents_states?: Record<string, CodexCollabAgentState>;
+  prompt?: string | null;
+  receiver_thread_ids?: string[];
+  sender_thread_id?: string;
+  tool?: string;
+}
+
+type CodexToolItem =
+  | CodexBaseItem
+  | CodexCollabToolCallItem
+  | CodexCommandExecutionItem
+  | CodexFileChangeItem
+  | CodexMcpToolCallItem
+  | CodexTodoListItem;
+
+const isCommandExecutionItem = (item: CodexToolItem): item is CodexCommandExecutionItem =>
+  item.type === CODEX_COMMAND_API;
+
+const isCollabToolCallItem = (item: CodexToolItem): item is CodexCollabToolCallItem =>
+  item.type === CODEX_COLLAB_TOOL_CALL_API;
+
+const isFileChangeItem = (item: CodexToolItem): item is CodexFileChangeItem =>
+  item.type === CODEX_FILE_CHANGE_API;
+
+const isMcpToolCallItem = (item: CodexToolItem): item is CodexMcpToolCallItem =>
+  item.type === CODEX_MCP_TOOL_CALL_API;
+
+const isTodoListItem = (item: CodexToolItem): item is CodexTodoListItem =>
+  item.type === CODEX_TODO_LIST_API;
+
+const toUsageData = (
+  raw:
+    | {
+        cached_input_tokens?: number;
+        input_tokens?: number;
+        output_tokens?: number;
+      }
+    | null
+    | undefined,
+): UsageData | undefined => {
+  if (!raw) return undefined;
+
+  const inputCacheMissTokens = raw.input_tokens || 0;
+  const inputCachedTokens = raw.cached_input_tokens || 0;
+  const totalInputTokens = inputCacheMissTokens + inputCachedTokens;
+  const totalOutputTokens = raw.output_tokens || 0;
+
+  if (totalInputTokens + totalOutputTokens === 0) return undefined;
+
+  return {
+    inputCachedTokens: inputCachedTokens || undefined,
+    inputCacheMissTokens,
+    totalInputTokens,
+    totalOutputTokens,
+    totalTokens: totalInputTokens + totalOutputTokens,
+  };
+};
+
+const normalizeTodoListItems = (item: CodexTodoListItem) =>
+  (item.items || [])
+    .map((todo) => ({
+      completed: !!todo.completed,
+      text: typeof todo.text === 'string' ? todo.text.trim() : '',
+    }))
+    .filter((todo) => todo.text.length > 0);
+
+/**
+ * Codex's `todo_list` only exposes a boolean completed flag. To light up the
+ * shared todo progress UI, treat the first incomplete item as the active one
+ * and the remaining incomplete items as pending.
+ */
+const synthesizeTodoListPluginState = (item: CodexTodoListItem) => {
+  const todos = normalizeTodoListItems(item);
+  if (todos.length === 0) return;
+
+  let assignedProcessing = false;
+  const items = todos.map((todo) => {
+    if (todo.completed) return { status: 'completed', text: todo.text } as const;
+    if (!assignedProcessing) {
+      assignedProcessing = true;
+      return { status: 'processing', text: todo.text } as const;
+    }
+    return { status: 'todo', text: todo.text } as const;
+  });
+
+  return {
+    todos: {
+      items,
+      updatedAt: new Date().toISOString(),
+    },
+  };
+};
+
+const synthesizeFileChangePluginState = (item: CodexFileChangeItem) => {
+  const changes = (item.changes || []).map((change) => ({
+    ...(change.diffText ? { diffText: change.diffText } : {}),
+    kind: change.kind,
+    linesAdded: change.linesAdded ?? 0,
+    linesDeleted: change.linesDeleted ?? 0,
+    path: change.path,
+  }));
+
+  if (changes.length === 0 && item.linesAdded === undefined && item.linesDeleted === undefined) {
+    return;
+  }
+
+  return {
+    changes,
+    ...(item.diffText ? { diffText: item.diffText } : {}),
+    linesAdded: item.linesAdded ?? 0,
+    linesDeleted: item.linesDeleted ?? 0,
+  };
+};
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+const stringifyUnknown = (value: unknown): string => {
+  if (typeof value === 'string') return value;
+  if (value === undefined || value === null) return '';
+
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+};
+
+const getRecordString = (record: Record<string, unknown>, key: string): string | undefined => {
+  const value = record[key];
+  return typeof value === 'string' && value.trim() ? value : undefined;
+};
+
+const unwrapMcpResultEnvelope = (value: unknown): unknown => {
+  if (!isRecord(value)) return value;
+
+  if ('Ok' in value) return value.Ok;
+  if ('Err' in value) return value.Err;
+  if ('ok' in value) return value.ok;
+
+  return value;
+};
+
+const getMcpContentItemText = (item: unknown): string => {
+  if (typeof item === 'string') return item;
+  if (!isRecord(item)) return stringifyUnknown(item);
+
+  const text = getRecordString(item, 'text') || getRecordString(item, 'content');
+  if (text) return text;
+
+  return stringifyUnknown(item);
+};
+
+const getMcpResultContent = (item: CodexMcpToolCallItem): string => {
+  const result = unwrapMcpResultEnvelope(item.result);
+
+  if (Array.isArray(result)) {
+    return result.map(getMcpContentItemText).filter(Boolean).join('\n\n');
+  }
+
+  if (isRecord(result)) {
+    if (Array.isArray(result.content)) {
+      return result.content.map(getMcpContentItemText).filter(Boolean).join('\n\n');
+    }
+
+    const text = getRecordString(result, 'text') || getRecordString(result, 'output');
+    if (text) return text;
+  }
+
+  return stringifyUnknown(result);
+};
+
+const getMcpErrorContent = (item: CodexMcpToolCallItem): string => {
+  const error = item.error || unwrapMcpResultEnvelope(item.result);
+
+  if (isRecord(error)) {
+    return (
+      getRecordString(error, 'message') ||
+      getRecordString(error, 'error') ||
+      stringifyUnknown(error)
+    );
+  }
+
+  return stringifyUnknown(error);
+};
+
+const hasMcpResultError = (item: CodexMcpToolCallItem): boolean => {
+  if (item.error) return true;
+
+  const result = item.result;
+  if (!isRecord(result)) return false;
+  if ('Err' in result) return true;
+
+  const ok = unwrapMcpResultEnvelope(result);
+  return isRecord(ok) && ok.isError === true;
+};
+
+const synthesizeMcpToolPluginState = (item: CodexMcpToolCallItem) => ({
+  arguments: item.arguments,
+  error: item.error,
+  result: item.result,
+  server: item.server,
+  status: item.status,
+  tool: item.tool,
+});
+
+const synthesizeCollabToolPluginState = (item: CodexCollabToolCallItem) => ({
+  agents_states: item.agents_states,
+  prompt: item.prompt,
+  receiver_thread_ids: item.receiver_thread_ids,
+  sender_thread_id: item.sender_thread_id,
+  status: item.status,
+  tool: item.tool,
+});
+
+const pluralize = (count: number, singular: string, plural = `${singular}s`) =>
+  count === 1 ? singular : plural;
+
+const toMcpToolPayloadArguments = (item: CodexMcpToolCallItem) => ({
+  arguments: item.arguments,
+  server: item.server,
+  tool: item.tool,
+});
+
+const toToolPayload = (item: CodexToolItem): ToolCallPayload => ({
+  apiName: item.type || CODEX_COMMAND_API,
+  arguments: JSON.stringify(
+    isCommandExecutionItem(item)
+      ? { command: item.command || '' }
+      : isMcpToolCallItem(item)
+        ? toMcpToolPayloadArguments(item)
+        : item,
+  ),
+  id: item.id,
+  identifier: CODEX_IDENTIFIER,
+  type: 'default',
+});
+
+const getFileChangeKind = (kind?: string) => {
+  switch (kind) {
+    case 'add': {
+      return 'added';
+    }
+    case 'delete':
+    case 'remove': {
+      return 'deleted';
+    }
+    case 'rename': {
+      return 'renamed';
+    }
+    default: {
+      return 'modified';
+    }
+  }
+};
+
+const summarizeTodoList = (item: CodexTodoListItem): string => {
+  const todos = normalizeTodoListItems(item);
+  if (todos.length === 0) return 'Todo list updated.';
+
+  const completed = todos.filter((todo) => todo.completed).length;
+  return `Todo list updated (${completed}/${todos.length} completed).`;
+};
+
+const summarizeFileChange = (item: CodexFileChangeItem): string => {
+  const counts = new Map<string, number>();
+
+  for (const change of item.changes || []) {
+    const kind = getFileChangeKind(change.kind);
+    counts.set(kind, (counts.get(kind) || 0) + 1);
+  }
+
+  const totalChanges = [...counts.values()].reduce((sum, count) => sum + count, 0);
+  if (totalChanges === 0) return 'File changes applied.';
+
+  const parts = [...counts.entries()].map(([kind, count]) => `${count} ${kind}`);
+  const statsSuffix =
+    item.linesAdded || item.linesDeleted
+      ? `, +${item.linesAdded || 0} -${item.linesDeleted || 0}`
+      : '';
+
+  return `File changes applied (${parts.join(', ')}${statsSuffix}).`;
+};
+
+const summarizeCollabToolCall = (item: CodexCollabToolCallItem): string => {
+  const toolName = item.tool || 'collaboration';
+  const agentStates = Object.values(item.agents_states || {});
+  const agentCount = item.receiver_thread_ids?.length || agentStates.length;
+  const completedMessage = agentStates.find(
+    (state) => state.status === 'completed' && typeof state.message === 'string' && state.message,
+  )?.message;
+
+  if (toolName === 'spawn_agent') {
+    return agentCount > 0
+      ? `Spawned ${agentCount} ${pluralize(agentCount, 'subagent')}.`
+      : 'Spawned subagent.';
+  }
+
+  if (toolName === 'wait') {
+    if (completedMessage) return `Wait completed: ${completedMessage}`;
+    return agentCount > 0
+      ? `Wait completed for ${agentCount} ${pluralize(agentCount, 'subagent')}.`
+      : 'Wait completed.';
+  }
+
+  return `${toolName} completed.`;
+};
+
+const summarizeFallbackTool = (item: CodexToolItem): string => {
+  return `Completed ${item.type}.`;
+};
+
+const getFailureVerb = (item: CodexToolItem): 'cancelled' | 'failed' =>
+  item.status === 'cancelled' ? 'cancelled' : 'failed';
+
+const getToolFailureContent = (item: CodexToolItem): string => {
+  if (isTodoListItem(item)) return `Todo list update ${getFailureVerb(item)}.`;
+  if (isFileChangeItem(item)) return `File changes ${getFailureVerb(item)}.`;
+  if (isMcpToolCallItem(item)) {
+    return getMcpErrorContent(item) || `MCP tool ${getFailureVerb(item)}.`;
+  }
+  if (isCollabToolCallItem(item)) return `${item.tool || 'Collaboration'} ${getFailureVerb(item)}.`;
+
+  return `${item.type} ${getFailureVerb(item)}.`;
+};
+
+const getToolContent = (item: CodexToolItem, isSuccess: boolean): string => {
+  if (isCommandExecutionItem(item)) {
+    return typeof item.aggregated_output === 'string' ? item.aggregated_output : '';
+  }
+
+  if (!isSuccess) return getToolFailureContent(item);
+
+  if (isTodoListItem(item)) return summarizeTodoList(item);
+  if (isFileChangeItem(item)) return summarizeFileChange(item);
+  if (isMcpToolCallItem(item)) return getMcpResultContent(item);
+  if (isCollabToolCallItem(item)) return summarizeCollabToolCall(item);
+
+  return summarizeFallbackTool(item);
+};
+
+const isSuccessfulToolCompletion = (item: CodexToolItem): boolean => {
+  if (isCommandExecutionItem(item)) {
+    const exitCode = item.exit_code ?? undefined;
+    return item.status === 'completed' && (exitCode === undefined || exitCode === 0);
+  }
+
+  if (isMcpToolCallItem(item) && hasMcpResultError(item)) return false;
+
+  return item.status !== 'cancelled' && item.status !== 'error' && item.status !== 'failed';
+};
+
+const getToolResultData = (item: CodexToolItem): ToolResultData => {
+  const isSuccess = isSuccessfulToolCompletion(item);
+  const output = getToolContent(item, isSuccess);
+
+  if (isCommandExecutionItem(item)) {
+    const exitCode = item.exit_code ?? undefined;
+
+    return {
+      content: output,
+      isError: !isSuccess,
+      pluginState: {
+        ...(exitCode !== undefined ? { exitCode } : {}),
+        ...(isSuccess ? {} : { error: output || `Command failed (${exitCode ?? 'unknown'})` }),
+        isBackground: false,
+        output,
+        stdout: output,
+        success: isSuccess,
+      },
+      toolCallId: item.id,
+    };
+  }
+
+  const pluginState =
+    isSuccess && isTodoListItem(item)
+      ? synthesizeTodoListPluginState(item)
+      : isSuccess && isFileChangeItem(item)
+        ? synthesizeFileChangePluginState(item)
+        : isMcpToolCallItem(item)
+          ? synthesizeMcpToolPluginState(item)
+          : isCollabToolCallItem(item)
+            ? synthesizeCollabToolPluginState(item)
+            : undefined;
+
+  return {
+    content: output,
+    isError: !isSuccess,
+    ...(pluginState ? { pluginState } : {}),
+    toolCallId: item.id,
+  };
+};
+
+const getEventModel = (raw: any): string | undefined => {
+  const candidates = [
+    raw?.model,
+    raw?.session?.model,
+    raw?.sessionMeta?.model,
+    raw?.session_meta?.model,
+    raw?.turn?.model,
+    raw?.turn_context?.model,
+  ];
+
+  return candidates.find((candidate): candidate is string => typeof candidate === 'string');
+};
+
+const getStringValue = (value: unknown): string | undefined =>
+  typeof value === 'string' && value.trim() ? value : undefined;
+
+const parseMaybeJsonError = (value: string): string => {
+  try {
+    const parsed = JSON.parse(value);
+    return (
+      getStringValue(parsed?.error?.message) ||
+      getStringValue(parsed?.message) ||
+      getStringValue(parsed?.error) ||
+      value
+    );
+  } catch {
+    return value;
+  }
+};
+
+const getCodexTerminalErrorMessage = (raw: any): string => {
+  const rawMessage =
+    getStringValue(raw?.message) ||
+    getStringValue(raw?.error?.message) ||
+    getStringValue(raw?.error) ||
+    getStringValue(raw?.result);
+
+  if (rawMessage) return parseMaybeJsonError(rawMessage);
+
+  if (raw?.error && typeof raw.error === 'object') {
+    return (
+      getStringValue(raw.error.message) ||
+      getStringValue(raw.error.type) ||
+      JSON.stringify(raw.error)
+    );
+  }
+
+  return 'Codex execution failed';
+};
+
+const getCodexTerminalErrorStderr = (raw: any): string | undefined => {
+  const rawMessage =
+    getStringValue(raw?.message) ||
+    getStringValue(raw?.error?.message) ||
+    getStringValue(raw?.error) ||
+    getStringValue(raw?.result);
+
+  return (
+    rawMessage ||
+    (raw?.error && typeof raw.error === 'object' ? JSON.stringify(raw.error) : undefined)
+  );
+};
+
+export class CodexAdapter implements AgentEventAdapter {
+  private currentAgentMessageItemId?: string;
+  private currentModel?: string;
+  sessionId?: string;
+
+  private hasTextInCurrentStep = false;
+  private hasToolActivitySinceAgentMessage = false;
+  private pendingToolCalls = new Set<string>();
+  private pendingToolCallStepIndex = new Map<string, number>();
+  private stepToolCalls: ToolCallPayload[] = [];
+  private stepToolCallIds = new Set<string>();
+  private started = false;
+  private stepIndex = 0;
+  private terminalEndEmitted = false;
+  private terminalErrorEmitted = false;
+
+  adapt(raw: any): HeterogeneousAgentEvent[] {
+    if (!raw || typeof raw !== 'object') return [];
+
+    switch (raw.type) {
+      case 'thread.started': {
+        this.sessionId = raw.thread_id;
+        return [];
+      }
+      case 'turn.started': {
+        return this.handleTurnStarted();
+      }
+      case 'session.configured':
+      case 'session_configured': {
+        return this.handleSessionConfigured(raw);
+      }
+      case 'turn.completed': {
+        return this.handleTurnCompleted(raw);
+      }
+      case 'error':
+      case 'turn.failed': {
+        return this.handleTerminalError(raw);
+      }
+      case 'item.started': {
+        return this.handleItemStarted(raw.item);
+      }
+      case 'item.completed': {
+        return this.handleItemCompleted(raw.item);
+      }
+      default: {
+        return [];
+      }
+    }
+  }
+
+  flush(): HeterogeneousAgentEvent[] {
+    return this.drainPendingToolEndEvents();
+  }
+
+  private handleTurnCompleted(raw: any): HeterogeneousAgentEvent[] {
+    if (this.terminalEndEmitted || this.terminalErrorEmitted) return [];
+
+    this.terminalEndEmitted = true;
+    const model = getEventModel(raw) || this.currentModel;
+    if (model) this.currentModel = model;
+
+    const usage = toUsageData(raw.usage);
+    const events = this.drainPendingToolEndEvents();
+
+    if (usage || model) {
+      const data: StepCompleteData = {
+        ...(model ? { model } : {}),
+        phase: 'turn_metadata',
+        provider: CODEX_IDENTIFIER,
+        ...(usage ? { usage } : {}),
+      };
+
+      events.push(this.makeEvent('step_complete', data));
+    }
+
+    if (this.started) events.push(this.makeEvent('stream_end', {}));
+    events.push(this.makeEvent('agent_runtime_end', {}));
+
+    return events;
+  }
+
+  private handleTerminalError(raw: any): HeterogeneousAgentEvent[] {
+    if (this.terminalErrorEmitted || this.terminalEndEmitted) return [];
+
+    this.terminalErrorEmitted = true;
+    const data: HeterogeneousTerminalErrorData = {
+      agentType: CODEX_IDENTIFIER,
+      clearEchoedContent: true,
+      message: getCodexTerminalErrorMessage(raw),
+      stderr: getCodexTerminalErrorStderr(raw),
+    };
+
+    const events: HeterogeneousAgentEvent[] = this.started
+      ? [this.makeEvent('stream_end', {})]
+      : [];
+    events.push(this.makeEvent('error', data));
+
+    return events;
+  }
+
+  private handleSessionConfigured(raw: any): HeterogeneousAgentEvent[] {
+    const model = getEventModel(raw);
+    if (!model || model === this.currentModel) return [];
+
+    this.currentModel = model;
+    return [
+      this.makeEvent('step_complete', {
+        model,
+        phase: 'turn_metadata',
+        provider: CODEX_IDENTIFIER,
+      } satisfies StepCompleteData),
+    ];
+  }
+
+  private handleTurnStarted(): HeterogeneousAgentEvent[] {
+    this.currentAgentMessageItemId = undefined;
+    this.hasTextInCurrentStep = false;
+    this.hasToolActivitySinceAgentMessage = false;
+    this.resetStepToolCalls();
+
+    if (!this.started) {
+      this.started = true;
+      return [this.makeEvent('stream_start', this.getStreamStartData())];
+    }
+
+    this.stepIndex += 1;
+    return [
+      this.makeEvent('stream_end', {}),
+      this.makeEvent('stream_start', this.getStreamStartData({ newStep: true })),
+    ];
+  }
+
+  private handleItemStarted(item: any): HeterogeneousAgentEvent[] {
+    if (!item?.id || !item?.type || item.type === 'agent_message') return [];
+
+    this.hasToolActivitySinceAgentMessage = true;
+
+    const tool = toToolPayload(item);
+    this.pendingToolCalls.add(tool.id);
+    this.pendingToolCallStepIndex.set(tool.id, this.stepIndex);
+
+    return this.emitToolChunk(tool);
+  }
+
+  private handleItemCompleted(item: any): HeterogeneousAgentEvent[] {
+    if (!item?.type) return [];
+
+    if (item.type === 'agent_message') {
+      if (!item.text) return [];
+
+      const events: HeterogeneousAgentEvent[] = [];
+      const shouldStartNewStep =
+        this.hasToolActivitySinceAgentMessage &&
+        !!item.id &&
+        item.id !== this.currentAgentMessageItemId;
+
+      if (shouldStartNewStep) {
+        this.stepIndex += 1;
+        this.resetStepToolCalls();
+        this.hasTextInCurrentStep = false;
+        events.push(this.makeEvent('stream_end', {}));
+        events.push(this.makeEvent('stream_start', this.getStreamStartData({ newStep: true })));
+      }
+
+      const content =
+        this.hasTextInCurrentStep && item.id !== this.currentAgentMessageItemId
+          ? `\n\n${item.text}`
+          : item.text;
+
+      this.currentAgentMessageItemId = item.id;
+      this.hasTextInCurrentStep = true;
+      this.hasToolActivitySinceAgentMessage = false;
+      events.push(
+        this.makeEvent('stream_chunk', {
+          chunkType: 'text',
+          content,
+        }),
+      );
+
+      return events;
+    }
+
+    if (!item.id) return [];
+
+    const events: HeterogeneousAgentEvent[] = [];
+    const pendingStepIndex = this.pendingToolCallStepIndex.get(item.id);
+    const belongsToCurrentStep =
+      pendingStepIndex === undefined || pendingStepIndex === this.stepIndex;
+
+    if (!this.pendingToolCalls.has(item.id)) {
+      const tool = toToolPayload(item);
+      this.pendingToolCallStepIndex.set(tool.id, this.stepIndex);
+      events.push(...this.emitToolChunk(tool));
+    }
+
+    this.pendingToolCalls.delete(item.id);
+    this.pendingToolCallStepIndex.delete(item.id);
+    if (belongsToCurrentStep) this.hasToolActivitySinceAgentMessage = true;
+    events.push(this.makeEvent('tool_result', getToolResultData(item as CodexToolItem)));
+    events.push(
+      this.makeEvent('tool_end', {
+        isSuccess: isSuccessfulToolCompletion(item as CodexToolItem),
+        toolCallId: item.id,
+      }),
+    );
+
+    return events;
+  }
+
+  private drainPendingToolEndEvents(): HeterogeneousAgentEvent[] {
+    const events = [...this.pendingToolCalls].map((toolCallId) =>
+      this.makeEvent('tool_end', {
+        isSuccess: false,
+        toolCallId,
+      }),
+    );
+
+    this.pendingToolCalls.clear();
+    this.pendingToolCallStepIndex.clear();
+    return events;
+  }
+
+  private emitToolChunk(tool: ToolCallPayload): HeterogeneousAgentEvent[] {
+    if (!this.stepToolCallIds.has(tool.id)) {
+      this.stepToolCallIds.add(tool.id);
+      this.stepToolCalls.push(tool);
+    }
+
+    return [
+      this.makeEvent('stream_chunk', {
+        chunkType: 'tools_calling',
+        toolsCalling: [...this.stepToolCalls],
+      }),
+      this.makeEvent('tool_start', {
+        toolCallId: tool.id,
+      }),
+    ];
+  }
+
+  private resetStepToolCalls(): void {
+    this.stepToolCalls = [];
+    this.stepToolCallIds.clear();
+  }
+
+  private getStreamStartData(extra: Record<string, unknown> = {}): StreamStartData {
+    return {
+      ...(this.currentModel ? { model: this.currentModel } : {}),
+      provider: CODEX_IDENTIFIER,
+      ...extra,
+    };
+  }
+
+  private makeEvent(type: HeterogeneousAgentEvent['type'], data: any): HeterogeneousAgentEvent {
+    return {
+      data,
+      stepIndex: this.stepIndex,
+      timestamp: Date.now(),
+      type,
+    };
+  }
+}
